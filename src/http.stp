@@ -1,0 +1,104 @@
+# Log of HTTP
+# As for the dealing of http request and response,
+# see send.stp and recv.stp
+
+%{	
+	#include <linux/tcp.h>
+	#include <net/tcp.h>
+%}
+
+function get_stap_http:long (sk:long, idx:long)
+%{
+	struct sock *sk = (struct sock *)STAP_ARG_sk;
+	struct stap_info *info = sk->sk_protinfo;
+
+	if (info && info->http)
+		STAP_RETVALUE = (long)(info->http + STAP_ARG_idx);
+	else
+		STAP_RETVALUE = 0;
+%}
+
+/**
+ * Log of HTTP transaction.
+ */
+function log_http (sk:long)
+{
+	if (%{stap_options.bitmap%} & %{STAPF_HTTP%})
+		do_log_http(sk)
+}
+
+function do_log_http (sk:long)
+{
+	http_count = %{STAP_VALUE(STAP_ARG_sk, http_count)%}
+	estab_t = %{STAP_VALUE(STAP_ARG_sk, estab_t)%}
+	req_begin = estab_t
+	cnt = 0
+
+	while (cnt < http_count) {
+		http = get_stap_http(sk, cnt)
+		if (!http) continue
+
+		tm_hour = %{STAP_HTTP_MEM_VALUE(STAP_ARG_http, tm, tm_hour)%}
+		tm_min = %{STAP_HTTP_MEM_VALUE(STAP_ARG_http, tm, tm_min)%}
+		tm_sec = %{STAP_HTTP_MEM_VALUE(STAP_ARG_http, tm, tm_sec)%}
+
+		rcv_req_ts = %{STAP_HTTP_VALUE(STAP_ARG_http, rcv_req_ts)%}	
+		xmit_resp_ts = %{STAP_HTTP_VALUE(STAP_ARG_http, xmit_resp_ts)%}	
+		last_ack_ts = %{STAP_HTTP_VALUE(STAP_ARG_http, last_ack_ts)%}
+		start_seq = %{STAP_HTTP_VALUE(STAP_ARG_http, start_seq)%}
+		end_snd_una = %{STAP_HTTP_VALUE(STAP_ARG_http, end_snd_una)%}
+
+		req_wait = resp_wait = trans_wait = -1
+
+		if (rcv_req_ts && req_begin && rcv_req_ts >= req_begin)
+			req_wait = rcv_req_ts - req_begin
+
+		if (xmit_resp_ts && rcv_req_ts && 
+			xmit_resp_ts >= rcv_req_ts)
+			resp_wait = xmit_resp_ts - rcv_req_ts
+
+		if (last_ack_ts && xmit_resp_ts &&
+			last_ack_ts >= xmit_resp_ts)
+			trans_wait = last_ack_ts - xmit_resp_ts
+
+		acked_data = end_snd_una - start_seq
+		if (acked_data > 0)
+			acked_data--
+		else if (acked_data < 0)
+			acked_data = -1
+
+		cnt++
+		time = sprintf("%02d:%02d:%02d", tm_hour, tm_min, tm_sec)
+
+		/* log format: default or detail */
+		if (!%{stap_options.detail_log%}) {
+			if (cnt == 1)
+				printf(",req_count=%u", http_count)
+
+			if (trans_wait >= %{stap_options.trans_time%} || 
+				trans_wait == -1) {
+				printf(",num=%d,time=%s,acked_data=%d", 
+					cnt, time, acked_data)
+				printf(",req_wait=%d,resp_wait=%d,trans_time=%d", 
+					req_wait, resp_wait, trans_wait)
+			}
+		} else {
+			if (cnt == 1)
+				printf("%-18s %-10s %-10s %-10s %-10s %-10s\n", 
+					"HTTP TABLE", "time", "ack_data", "req_wait", 
+					"resp_wait", "trans_time")
+
+			if (trans_wait >= %{stap_options.trans_time%} ||
+				trans_wait == -1) {
+				blank = "  "
+				printf("Num.%-14d %s%s %-10d %-10d %-10d %-10d\n", 
+					cnt, time, blank, acked_data, req_wait, resp_wait, 
+					trans_wait)
+			}
+		}
+			
+		req_begin = last_ack_ts
+	}
+}
+
+

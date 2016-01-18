@@ -1,0 +1,138 @@
+# Recv Routine
+
+%{
+	#include <linux/tcp.h>
+	#include <net/tcp.h>
+%}
+
+/** 
+ * Receive data.
+ */
+probe trans.Recv = 
+	kernel.function("tcp_event_data_recv")
+{
+	if (mem_is_stop()) next
+	if (!$sk->sk_protinfo)
+		next
+
+	do_Recv($sk)
+}
+
+function do_Recv(sk:long)
+%{
+	struct sock *sk = (struct sock *)STAP_ARG_sk;
+	struct inet_connection_sock *icsk = inet_csk(sk);
+	struct stap_info *info = sk->sk_protinfo;
+	struct stap_http *http;
+	struct timeval tv;
+	unsigned long time;
+	void *ptr;
+
+	/* -H option, HTTP performance */
+	if (info->http && info->http_alloc) {
+		/* run out of pre allocated http structs */
+		if (info->http_count >= info->http_alloc) {
+			if (info->http_alloc >= STAP_HTTP_MAX_CNT)
+				goto OUT;
+
+			ptr = krealloc(info->http, sizeof(struct stap_http) *
+				(info->http_alloc + STAP_HTTP_INIT_CNT),
+				GFP_ATOMIC | __GFP_ZERO);
+			if (!ptr)
+				goto OUT;
+
+			info->http = ptr;
+			info->http_alloc += STAP_HTTP_INIT_CNT;
+			atomic64_add(STAP_HTTP_INIT_CNT, &stap_mem.alloc.http);
+		}
+
+		/* Corner case: request is composed of multi packets */
+		if (info->http_count) {
+			http = info->http + (info->http_count -1);
+			if (http && !http->xmit_resp_ts)
+				goto OUT;
+		}
+
+		info->http_count++;
+		info->http_offset = tcp_sk(sk)->packets_out? 2 : 1;
+
+		http = info->http + (info->http_count - 1);
+		if (http) {
+			http->rcv_req_ts = tcp_time_stamp;
+			do_gettimeofday(&tv);
+			time = tv.tv_sec + 8 * 3600;
+			rtc_time_to_tm(time, &http->tm);
+		}
+	}
+
+OUT:
+	return;	
+%}
+
+/**
+ * HTTP response is ACKed. 
+ */
+probe http.RespEnd = 
+	kernel.function("tcp_rearm_rto")
+{
+	if (mem_is_stop()) next
+	if (!$sk->sk_protinfo)
+		next
+
+	do_RespEnd($sk)
+}
+
+function do_RespEnd(sk:long)
+%{
+	struct sock *sk = (struct sock *)STAP_ARG_sk;
+	struct stap_info *info = sk->sk_protinfo;
+	struct stap_http *http, *next;
+
+	if (!info->http || !info->http_count || 
+		info->http_count < info->http_offset)
+		return;
+
+	http = info->http + (info->http_count - info->http_offset);
+
+	if (http) {
+		http->last_ack_ts = tcp_time_stamp;
+		http->end_snd_una = tcp_sk(sk)->snd_una;
+
+		if (info->http_offset == 2) {
+			next = http + 1;
+			http->last_ack_ts = next->rcv_req_ts;
+		}
+		info->http_offset = 1;
+
+		/* For HTTP trans_time filter */
+		if (http->last_ack_ts && http->xmit_resp_ts &&
+			http->last_ack_ts - http->xmit_resp_ts >= 
+			stap_options.trans_time)
+			info->http_filter = 1;
+	}
+%}
+
+/** 
+ * Receive an ACK.
+ */
+probe trans.RecvACK = 
+	kernel.statement("tcp_ack@net/ipv4/tcp_input.c:3756")
+{
+	if (mem_is_stop()) next
+	if (!$sk->sk_protinfo)
+		next
+
+    do_RecvACK($sk, $skb)	
+}
+
+function do_RecvACK(sk:long, skb:long)
+%{
+	struct sock *sk = (struct sock *)STAP_ARG_sk;
+	struct sk_buff *skb = (struct sk_buff *)STAP_ARG_skb;
+	struct stap_info *info = sk->sk_protinfo;
+	
+	if (skb && !tcp_hdr(skb)->window)
+		info->zero_awnd++;
+%}
+
+

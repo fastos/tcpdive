@@ -1,0 +1,139 @@
+# RTT and RTO
+
+%{
+	#include <linux/tcp.h>
+	#include <net/tcp.h>
+%}
+
+/**
+ * RTT, round trip time.
+ */
+probe trans.Rtt =
+	kernel.function("tcp_valid_rtt_meas")
+{
+	if (mem_is_stop()) next
+	if (!$sk || !$sk->sk_protinfo)
+		next
+
+	do_Rtt($sk, $seq_rtt)
+}
+
+function do_Rtt(sk:long, rtt:long)
+%{
+	struct sock *sk = (struct sock *)STAP_ARG_sk;
+	struct stap_info *info = sk->sk_protinfo;
+	u32 new_rtt = STAP_ARG_rtt;
+
+	/* Check carefully 8) */
+	if (new_rtt == INIT_VALUE || 
+		sk->sk_state == TCP_LISTEN ||
+		sk->sk_state == TCP_SYN_SENT ||
+		sk->sk_state == TCP_SYN_RECV)
+		return;
+
+	/* First rtt sample */
+	if (!info->rtt_cnt) {
+		info->rtt[0] = new_rtt;
+		info->rtt[2] = new_rtt;
+	}
+
+	/* Update min and max */
+	if (new_rtt < info->rtt[0])
+		info->rtt[0] = new_rtt;
+	if (new_rtt > info->rtt[2])
+		info->rtt[2] = new_rtt;
+
+	info->rtt[1] += new_rtt;
+	info->rtt_cnt++;
+%}
+
+/** 
+ * RTO, retransmission timeout.
+ */
+probe trans.Rto = 
+	kernel.function("tcp_set_rto")
+{
+	if (mem_is_stop()) next
+	if (!$sk || !$sk->sk_protinfo)
+		next
+
+	do_Rto($sk)	
+}
+
+function do_Rto(sk:long)
+%{
+	struct sock *sk = (struct sock *)STAP_ARG_sk;
+	struct tcp_sock *tp = tcp_sk(sk);
+	struct stap_info *info = sk->sk_protinfo;
+	u32 new_rto;
+
+	/* Check carefully 8) */
+	if (sk->sk_state == TCP_LISTEN ||
+		sk->sk_state == TCP_SYN_SENT ||
+		sk->sk_state == TCP_SYN_RECV)
+		return;
+
+	new_rto = (tp->srtt >> 3) + tp->rttvar;
+	if (new_rto > TCP_RTO_MAX)
+		new_rto = TCP_RTO_MAX;
+
+	info->rto[1] += new_rto;
+	info->rto_cnt++;
+
+	/* First rto sample */
+	if (!info->rto[0])
+		info->rto[0] = new_rto;
+	if (!info->rto[2])
+		info->rto[2] = new_rto;
+
+	/* Update min and max */
+	if (new_rto < info->rto[0])
+		info->rto[0] = new_rto;
+	if (new_rto > info->rto[2])
+		info->rto[2] = new_rto;
+%}
+
+/**
+ * Log RTT and RTO.
+ */
+function log_rtt_rto (sk:long)
+{
+	rtt_min = %{STAP_VALUE(STAP_ARG_sk, rtt[0])%}
+	rtt_sum = %{STAP_VALUE(STAP_ARG_sk, rtt[1])%}
+	rtt_max = %{STAP_VALUE(STAP_ARG_sk, rtt[2])%}
+
+	rto_min = %{STAP_VALUE(STAP_ARG_sk, rto[0])%}
+	rto_sum = %{STAP_VALUE(STAP_ARG_sk, rto[1])%}
+	rto_max = %{STAP_VALUE(STAP_ARG_sk, rto[2])%}
+
+	rtt_cnt = %{STAP_VALUE(STAP_ARG_sk, rtt_cnt)%}
+	rto_cnt = %{STAP_VALUE(STAP_ARG_sk, rto_cnt)%}
+
+	if (!rtt_cnt)
+		rtt_cnt = rtt_avg = rtt_min = rtt_max = -1
+	else
+		rtt_avg = rtt_sum / rtt_cnt
+	
+	if (!rto_cnt)
+		rto_cnt = rto_avg = rto_min = rto_max = -1
+	else
+		rto_avg = rto_sum / rto_cnt
+
+	/* log format: default or detail */
+	if (!%{stap_options.detail_log%}) {
+			printf(",rtt_avg=%d,rtt_min=%d,rtt_max=%d,rtt_cnt=%d", 
+				rtt_avg, rtt_min, rtt_max, rtt_cnt)
+			printf(",rto_avg=%d,rto_min=%d,rto_max=%d,rto_cnt=%d", 
+				rto_avg, rto_min, rto_max, rto_cnt)
+	} else {
+		printf("%-18s %-10s %-10s %-10s %-10s\n", 
+			"RTT TABLE", "avg", "min", "max", "cnt")
+		printf("%-18s %-10d %-10d %-10d %-10d\n", "RTT(ms)", 
+			rtt_avg, rtt_min, rtt_max, rtt_cnt)	
+		printf("%-18s %-10d %-10d %-10d %-10d\n", "RTO(ms)", 
+			rto_avg, rto_min, rto_max, rto_cnt)
+		printf("\n")
+	}
+}
+
+

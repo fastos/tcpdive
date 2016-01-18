@@ -1,0 +1,781 @@
+# Congestion control (Cubic algorithm)
+
+%{
+	#include <linux/tcp.h>
+	#include <net/tcp.h>
+	#include <linux/stddef.h>
+
+	struct bictcp {
+		u32	cnt;		
+		u32 last_max_cwnd;	
+		u32	loss_cwnd;	
+		u32	last_cwnd;	
+		u32	last_time;	
+		u32	bic_origin_point;
+		u32	bic_K;		
+		u32	delay_min;	
+		u32	epoch_start;
+		u32	ack_cnt;	
+		u32	tcp_cwnd;	
+		#define ACK_RATIO_SHIFT	4
+		#define ACK_RATIO_LIMIT (32u << ACK_RATIO_SHIFT)
+		u16	delayed_ack;	
+		u8	sample_cnt;	
+		u8	found;		
+		u32	round_start;	
+		u32	end_seq;	
+		u32	last_ack;	
+		u32	curr_rtt;	
+	};
+
+	enum {
+		POINT_NULL = 0,
+		POINT_SS_START = 1,
+		POINT_SS_END = 2,
+		POINT_EP_START = 3,
+		POINT_EP_STEADY = 4,
+		POINT_EP_END = 5,
+		POINT_MAX = 6
+	};
+
+	enum {
+		MSG_NULL = 0,
+		MSG_SS_STD = 1,
+		MSG_SS_ACK = 2,
+		MSG_SS_DELAY = 3,
+		MSG_SS_ABORT = 4,
+		MSG_SS_CLOSE = 5,
+		MSG_EP_SEARCH = 6,
+		MSG_EP_PROBE = 7,
+		MSG_MAX = 8
+	};
+
+	static const char *point_name[POINT_MAX] = {
+		"null",
+		"SS start",
+		"SS end",
+		"EP start",
+		"EP steady",
+		"EP end"
+	};
+
+	static const char *msg_name[MSG_MAX] = {
+		"null",
+		"std",
+		"ack",
+		"delay",
+		"abort",
+		"close",
+		"search",
+		"probe"
+	};
+
+	/* Advanced Congestion Control, -A option */
+	static void advanced_cc_set(struct sock *sk, int point, int msg)
+	{
+		struct stap_info *info = sk->sk_protinfo;
+		struct stap_cong *cong = info->cong;
+
+		if (!(stap_options.bitmap & STAPF_ADCONG) || !cong || 
+			!cong->adcong_flag)
+			return;
+
+		if (atomic_inc_return(&cong->adcong_cnt) <= stap_options.ad_cong) {
+			cong->adcong_point = point;
+			cong->adcong_msg = msg;
+		} else
+			cong->adcong_flag = 0;
+	}
+%}
+
+/**
+ * State machine of slow start.
+ */
+probe cong.StMachine =  
+	kernel.function("bictcp_cong_avoid")
+{
+	if (mem_is_stop()) next
+	if (!$sk->sk_protinfo)
+		next
+
+	if (!cwnd_limited($sk, $in_flight)) 
+		next
+
+	state_machine($sk)
+	log_advanced_cc($sk)
+}
+
+function cwnd_limited:long (sk:long, in_flight:long)
+%{
+	struct sock *sk = (struct sock *)STAP_ARG_sk;
+	struct tcp_sock *tp = tcp_sk(sk);
+	struct stap_info *info = sk->sk_protinfo;
+	struct stap_cong *cong = info->cong;
+	int ret;
+
+	if (!cong)
+		return;
+
+	/* First ACK */
+	if (!info->init_cwnd) {
+		info->init_cwnd = tp->snd_cwnd;
+		info->init_ssthr = tp->snd_ssthresh;
+	}
+
+	ret = tcp_is_cwnd_limited(sk, STAP_ARG_in_flight);
+	cong->cwnd_unlimit += !ret;
+	STAP_RETVALUE = ret;
+%}
+
+function state_machine (sk:long)
+%{
+	struct sock *sk = (struct sock *)STAP_ARG_sk;
+	struct stap_info *info = sk->sk_protinfo;
+	struct stap_cong *cong = info->cong;
+	struct tcp_sock *tp = tcp_sk(sk);
+	struct bictcp *ca = inet_csk_ca(sk);
+	int i, idx;
+
+	if (!cong)
+		return;
+
+	/* first ACK */
+	if (!info->init_cwnd) {
+		info->init_cwnd = tp->snd_cwnd;
+		info->init_ssthr = tp->snd_ssthresh;
+	}
+
+	/* slow start begin point:
+	 * 1.connection begin
+	 * 2.timeout loss
+	 * 3.cong to slow start
+	 */
+	if (!cong->ss_running && tp->snd_cwnd <= tp->snd_ssthresh) {
+		cong->ss_running = 1;
+		cong->ss_rtt_cnt = 0;
+		cong->ss_enter_cwnd = tp->snd_cwnd;
+
+		/* Advanced CC, SS Start */
+		advanced_cc_set(sk, POINT_SS_START, MSG_NULL);
+	}
+
+	/* slow start end point:
+	 * 1.successfully switch to cong avoid 
+	 */
+	if (cong->ss_running && tp->snd_cwnd > tp->snd_ssthresh) {
+		idx = ca->found;
+		idx = idx == 3 ? 1 : idx;
+
+		/* Advanced CC, SS End */
+		advanced_cc_set(sk, POINT_SS_END, idx + 1);
+
+AGAIN:
+		cong->ss_cnt[idx]++;
+		cong->ss_time[idx] += cong->ss_rtt_cnt;
+		cong->ss_start_cwnd[idx] += cong->ss_enter_cwnd;
+		cong->ss_end_cwnd[idx] += tp->snd_ssthresh;
+		
+		if (ca->found == 3 && idx == 1) {
+			idx = 2;
+			goto AGAIN;
+		}
+
+		/* do cleaning */
+		cong->ss_running = 0;
+		cong->ss_enter_cwnd = 0;
+		cong->ss_rtt_cnt = 0;
+		cong->epoch_switch = 0;
+		cong->epoch_switch_ts = 0;
+	}
+%}
+
+/** 
+ * Count RTTs experienced by slow start.
+ */
+probe cong.RttCnt = 
+	kernel.function("bictcp_hystart_reset")
+{
+	if (mem_is_stop()) next
+	if (!$sk->sk_protinfo)
+		next
+
+	do_RttCnt($sk)
+}
+
+function do_RttCnt (sk:long)
+%{
+	struct sock *sk = (struct sock *)STAP_ARG_sk;
+	struct stap_info *info = sk->sk_protinfo;
+	struct stap_cong *cong = info->cong;
+
+	if (!cong)
+		return;
+
+	if (cong->ss_running)
+		cong->ss_rtt_cnt++;
+%}
+
+/** 
+ * First loss event
+ * Slow start abort
+ * Epoch end point
+ */
+probe cong.SetSsthresh = 
+	kernel.function("bictcp_recalc_ssthresh")
+{
+	if (mem_is_stop()) next
+	if (!$sk->sk_protinfo)
+		next
+
+	do_SetSsthresh($sk)
+
+	/* Epoch end point */
+	epoch_end($sk)
+	log_advanced_cc($sk)
+}
+
+function do_SetSsthresh (sk:long)
+%{
+	struct sock *sk = (struct sock *)STAP_ARG_sk;
+	struct stap_info *info = sk->sk_protinfo;
+	struct stap_cong *cong = info->cong;
+	struct tcp_sock *tp = tcp_sk(sk);
+	struct bictcp *ca = inet_csk_ca(sk);
+
+	if (!cong)
+		return;
+
+	/* First loss event */
+	if (!cong->fl_cwnd) {
+		cong->fl_phase = cong->ss_running ? 0 : 1;
+		cong->fl_cwnd = tp->snd_cwnd;
+		cong->fl_rtt = tp->srtt >> 3; 
+	}
+
+	/* Slow start abort due to loss */
+	if (cong->ss_running) {
+		cong->ss_cnt[3]++;
+		cong->ss_time[3] += cong->ss_rtt_cnt;
+		cong->ss_start_cwnd[3] += cong->ss_enter_cwnd;
+		cong->ss_end_cwnd[3] += tp->snd_cwnd;
+
+		cong->ss_running = 0;
+		cong->ss_enter_cwnd = 0;
+		cong->ss_rtt_cnt = 0;
+
+		/* Advanced CC, SS End */
+		advanced_cc_set(sk, POINT_SS_END, MSG_SS_ABORT);
+	}
+
+	/* Fast convergence */
+	if (tp->snd_cwnd < ca->last_max_cwnd)
+		cong->fast_converg++;
+%}
+
+function epoch_end(sk:long)
+%{
+	struct sock *sk = (struct sock *)STAP_ARG_sk;
+	struct tcp_sock *tp = tcp_sk(sk);
+	struct bictcp *ca = inet_csk_ca(sk);
+	struct stap_info *info = sk->sk_protinfo;
+	struct stap_cong *cong = info->cong;
+	u32 rtt_cnt = 0, msg;
+
+	if (!cong || tp->snd_cwnd < tp->snd_ssthresh ||
+		cong->ss_running || !ca->epoch_start)
+		return;
+
+	/* cwnd and rtt at this moment */
+	cong->epoch_cwnd[2] += tp->snd_cwnd;
+	cong->epoch_rtt[2] += tp->srtt >> 3;
+	cong->epoch_cnt[2]++;
+
+	/* Phase time, unit is RTT */
+	if (tp->srtt)
+		rtt_cnt = ((tcp_time_stamp - ca->epoch_start) << 3) / tp->srtt;
+	
+	cong->phase_time[0] += rtt_cnt;
+	cong->phase_cnt[0]++;
+
+	if (!ca->bic_K) {
+		cong->phase_time[2] += rtt_cnt;
+		cong->phase_cnt[2]++;
+		msg = MSG_EP_PROBE; 
+	} else if (cong->epoch_switch) {
+		cong->phase_time[2] += 
+			((tcp_time_stamp - cong->epoch_switch_ts) << 3) / tp->srtt;
+		cong->phase_cnt[2]++;
+		msg = MSG_EP_PROBE;
+	} else {
+		cong->phase_time[1] += rtt_cnt;
+		cong->phase_cnt[1]++;
+		msg = MSG_EP_SEARCH;
+	}
+	
+	cong->epoch_switch = 0;
+	cong->epoch_switch_ts = 0;
+
+	/* Advanced CC, Epoch End */
+	advanced_cc_set(sk, POINT_EP_END, msg);
+%}
+
+/* Called when conn is gonna to be closed */
+function cong_close_update(sk:long)
+{
+	if ((%{stap_options.bitmap & (STAPF_CONG | STAPF_ADCONG)%})
+		&& current_algorithm(sk, "cubic")) {
+
+		/* Advanced CC, SS Close point */
+		if (%{stap_options.bitmap%} & %{STAPF_ADCONG%})
+			ss_close_update(sk)
+
+		/* Epoch end point */
+		epoch_end(sk)
+		log_advanced_cc(sk)
+	}
+}
+
+function current_algorithm:long (sk:long, name:string)
+%{
+	struct sock *sk = (struct sock *)STAP_ARG_sk;
+	struct inet_connection_sock *icsk = inet_csk(sk);
+	u32 ret = 0;
+
+	if (strcmp(icsk->icsk_ca_ops->name, STAP_ARG_name) == 0)
+		ret = 1;
+
+	STAP_RETVALUE = ret;
+%}
+
+function ss_close_update(sk:long)
+%{
+	struct sock *sk = (struct sock *)STAP_ARG_sk;
+	struct tcp_sock *tp = tcp_sk(sk);
+	struct stap_info *info = sk->sk_protinfo;
+	struct stap_cong *cong = info->cong;
+
+	if (cong && tp->snd_cwnd < tp->snd_ssthresh &&
+		cong->ss_running) {
+		advanced_cc_set(sk, POINT_SS_END, MSG_SS_CLOSE);
+	}
+%}
+
+function get_sock_from_ca:long (ca:long)
+%{
+	struct bictcp *ca = (void *)STAP_ARG_ca;
+	struct sock *sk = (struct sock *)((char *)ca - 
+		offsetof(struct inet_connection_sock, icsk_ca_priv));
+
+	STAP_RETVALUE = (long)sk;
+%}
+
+/** 
+ * Epoch start point.
+ */
+probe cong.EpochStart =
+	kernel.statement("bictcp_update@net/ipv4/tcp_cubic.c:223")
+{
+	if (mem_is_stop()) next
+	sk = get_sock_from_ca($ca)
+	if (!@cast(sk, "struct sock")->sk_protinfo)
+		next
+
+	do_EpochStart(sk, $cwnd)
+	log_advanced_cc(sk)
+}
+
+function do_EpochStart (sk:long, cwnd:long)
+%{
+	struct sock *sk = (struct sock *)STAP_ARG_sk;
+	struct tcp_sock *tp = tcp_sk(sk);
+	struct bictcp *ca = inet_csk_ca(sk);
+	struct stap_info *info = sk->sk_protinfo;
+	struct stap_cong *cong = info->cong;
+	u32 msg;
+
+	if (!cong)
+		return;
+
+	cong->epoch_cwnd[0] += tp->snd_cwnd;
+	cong->epoch_rtt[0] += tp->srtt >> 3;
+	cong->epoch_cnt[0]++;
+
+	cong->epoch_switch = 0;
+	cong->epoch_switch_ts = 0;
+
+	if (ca->last_max_cwnd <= STAP_ARG_cwnd)
+		msg = MSG_EP_PROBE;
+	else
+		msg = MSG_EP_SEARCH;
+
+	/* Advanced CC, Epoch Start */
+	advanced_cc_set(sk, POINT_EP_START, msg);
+%}
+
+/**
+ * Epoch steady point.
+ */
+probe cong.EpochSteady =
+	kernel.statement("bictcp_update@net/ipv4/tcp_cubic.c:254")
+{
+	if (mem_is_stop()) next
+	sk = get_sock_from_ca($ca)
+	if (!@cast(sk, "struct sock")->sk_protinfo)
+		next
+
+	do_EpochSteady(sk)
+	log_advanced_cc(sk)
+}
+
+function do_EpochSteady (sk:long)
+%{
+	struct sock *sk = (struct sock *)STAP_ARG_sk;
+	struct tcp_sock *tp = tcp_sk(sk);
+	struct bictcp *ca = inet_csk_ca(sk);
+	struct stap_info *info = sk->sk_protinfo;
+	struct stap_cong *cong = info->cong;
+	u32 now;
+	
+	if (!cong)
+		return;
+
+	now	= ((tcp_time_stamp + msecs_to_jiffies(ca->delay_min>>3)
+			- ca->epoch_start) << 10) / HZ;
+
+	if (!cong->epoch_switch && ca->bic_K && now > ca->bic_K) {
+		cong->epoch_switch = 1;
+		cong->epoch_switch_ts = tcp_time_stamp;
+
+		cong->epoch_rtt[1] += tp->srtt >> 3;
+		cong->epoch_cwnd[1] += tp->snd_cwnd;
+		cong->epoch_cnt[1]++;
+
+		cong->phase_cnt[1]++;
+		if (tp->srtt)
+			cong->phase_time[1] += 
+				((tcp_time_stamp - ca->epoch_start) << 3) / tp->srtt;
+
+		/* Advanced CC, Epoch Steady point */
+		advanced_cc_set(sk, POINT_EP_STEADY, MSG_NULL);
+	}
+%}
+
+/**
+ * Log cwnd and ssthresh.
+ */
+function log_cwnd_ssthr (sk:long)
+{
+	init_cwnd = %{STAP_VALUE(STAP_ARG_sk, init_cwnd)%}
+	end_cwnd = %{STAP_VALUE(STAP_ARG_sk, end_cwnd)%}
+	init_ssthr = %{STAP_VALUE(STAP_ARG_sk, init_ssthr)%}
+	end_ssthr = %{STAP_VALUE(STAP_ARG_sk, end_ssthr)%}
+
+	if (!%{stap_options.detail_log%})
+		printf(",init_cwnd=%d,end_cwnd=%d,init_ssthr=%d,end_ssthr=%d",
+			init_cwnd, end_cwnd, init_ssthr, end_ssthr)
+	else {
+		printf("%-18s %u\n", "init_cwnd", init_cwnd)
+		printf("%-18s %u\n", "end_cwnd", end_cwnd)
+		printf("%-18s %u\n", "init_ssthresh", init_ssthr)
+		printf("%-18s %u\n", "end_ssthresh", end_ssthr)
+		printf("\n")
+	}
+}
+
+/**
+ * Log of advanced congestion control, -A option.
+ */ 
+function log_advanced_cc:long (sk:long)
+{
+	if (!(%{stap_options.bitmap%} & %{STAPF_ADCONG%}) ||
+		cong_is_null(sk))
+		return 0
+
+	flag = %{STAP_MEM_VALUE(STAP_ARG_sk, cong, adcong_flag)%}
+	point = %{STAP_MEM_VALUE(STAP_ARG_sk, cong, adcong_point)%}
+	if (!flag || point == %{POINT_NULL%})
+		return 0
+
+	isn = %{STAP_VALUE(STAP_ARG_sk, isn)%}
+	cwnd = %{((struct tcp_sock *)STAP_ARG_sk)->snd_cwnd%}
+	rtt = %{((struct tcp_sock *)STAP_ARG_sk)->srtt >> 3%}
+
+	printf("[%s],%s,%s,id=%d,cwnd=%d,rtt=%d,time=%d,msg=%s\n",
+		get_point_name(sk), get_full_time(), get_socket_addr(sk),
+		isn, cwnd, rtt, get_time_elapsed(sk),
+		get_msg_name(sk))
+
+	advanced_cc_clear(sk)
+	return point
+}
+
+function cong_is_null:long (sk:long)
+%{
+	struct sock *sk = (struct sock *)STAP_ARG_sk;
+	struct stap_info *info = sk->sk_protinfo;
+	struct stap_cong *cong = info->cong;
+
+	STAP_RETVALUE = !cong;
+%}
+
+function get_point_name:string (sk:long)
+%{
+	struct sock *sk = (struct sock *)STAP_ARG_sk;
+	struct stap_info *info = sk->sk_protinfo;
+	struct stap_cong *cong = info->cong;
+
+	sprintf(STAP_RETVALUE, "%s", point_name[cong->adcong_point]);
+%}
+
+function get_msg_name:string (sk:long)
+%{
+	struct sock *sk = (struct sock *)STAP_ARG_sk;
+	struct stap_info *info = sk->sk_protinfo;
+	struct stap_cong *cong = info->cong;
+
+	sprintf(STAP_RETVALUE, "%s", msg_name[cong->adcong_msg]);
+%}
+
+function get_time_elapsed:long (sk:long)
+%{
+	struct sock *sk = (struct sock *)STAP_ARG_sk;
+	struct stap_info *info = sk->sk_protinfo;
+	
+	STAP_RETVALUE = tcp_time_stamp - info->estab_t;
+%}
+
+function advanced_cc_clear(sk:long)
+%{
+	struct sock *sk = (struct sock *)STAP_ARG_sk;
+	struct stap_info *info = sk->sk_protinfo;
+	struct stap_cong *cong = info->cong;
+	
+	cong->adcong_point = POINT_NULL;
+	cong->adcong_msg = MSG_NULL;
+%}
+
+/**
+ * Log of congestion control, -C option.
+ */
+function log_cong (sk:long)
+{
+	if (%{stap_options.bitmap & STAPF_CONG%} && 
+		!cong_is_null(sk)) {
+		if (!%{stap_options.detail_log%})
+			log_default_cong(sk)
+		else
+			log_detail_cong(sk)
+	}
+}
+
+/* log format: default */
+function log_default_cong (sk:long)
+{
+	log_default_first_loss(sk)
+	log_default_slow_start(sk)
+	log_default_cong_avoid(sk)
+}
+
+/* first loss event */
+function log_default_first_loss (sk:long)
+{
+	fl_phase = %{STAP_MEM_VALUE(STAP_ARG_sk, cong, fl_phase)%}
+	fl_cwnd = %{STAP_MEM_VALUE(STAP_ARG_sk, cong, fl_cwnd)%}
+	fl_rtt = %{STAP_MEM_VALUE(STAP_ARG_sk, cong, fl_rtt)%}
+
+	if (!fl_cwnd)
+		printf(",fl_phase=-1,fl_cwnd=-1,fl_rtt=-1")
+	else
+		printf(",fl_phase=%s,fl_cwnd=%d,fl_rtt=%d",
+			fl_phase ? "cong" : "ss", fl_cwnd, fl_rtt)
+}
+
+/* slow start info */
+function log_default_slow_start (sk:long)
+{
+	for (i = 0; i < 4; i++) {
+		ss_cnt = %{STAP_MEM_VALUE(STAP_ARG_sk, cong, 
+				ss_cnt[STAP_ARG_i])%}
+		ss_time = %{STAP_MEM_VALUE(STAP_ARG_sk, cong, 
+				ss_time[STAP_ARG_i])%}
+		ss_start_cwnd = %{STAP_MEM_VALUE(STAP_ARG_sk, cong, 
+					ss_start_cwnd[STAP_ARG_i])%}
+		ss_end_cwnd = %{STAP_MEM_VALUE(STAP_ARG_sk, cong, 
+					ss_end_cwnd[STAP_ARG_i])%}
+
+		if (ss_cnt) {
+			ss_time /= ss_cnt
+			ss_start_cwnd /= ss_cnt
+			ss_end_cwnd /= ss_cnt
+		} else
+			ss_cnt = ss_time = ss_start_cwnd = ss_end_cwnd = -1
+
+		if (i == 0) prefix = "std_"
+		else if (i == 1) prefix = "ack_"
+		else if (i == 2) prefix = "delay_"
+		else prefix = "abort_"
+
+		printf(",%s=%d,%s=%d,%s=%d,%s=%d",
+			prefix . "ss_cnt", ss_cnt,
+			prefix . "ss_time", ss_time,
+			prefix . "start_cwnd", ss_start_cwnd,
+			prefix . "end_cwnd", ss_end_cwnd)
+	}
+}
+
+/* congestion avoidance info */
+function log_default_cong_avoid (sk:long)
+{
+	cwnd_unlimit = %{STAP_MEM_VALUE(STAP_ARG_sk, cong, cwnd_unlimit)%}
+	fast_converg = %{STAP_MEM_VALUE(STAP_ARG_sk, cong, fast_converg)%}
+
+	printf(",cwnd_unlimit=%d,fast_converg=%d",
+		cwnd_unlimit,fast_converg)
+
+	for (i = 0; i < 3; i++) {
+		phase_cnt = %{STAP_MEM_VALUE(STAP_ARG_sk, cong, 
+				phase_cnt[STAP_ARG_i])%}
+		phase_time = %{STAP_MEM_VALUE(STAP_ARG_sk, cong, 
+				phase_time[STAP_ARG_i])%}
+
+		if (!phase_cnt)
+			phase_cnt = phase_time = -1
+
+		if (i == 0) prefix = "epoch_"
+		else if (i == 1) prefix = "search_"
+		else prefix = "probe_"
+
+		printf(",%s=%d,%s=%d",
+			prefix . "cnt", phase_cnt,
+			prefix . "time", phase_time)
+	}
+
+	for (i = 0; i < 3; i++) {
+		epoch_cwnd = %{STAP_MEM_VALUE(STAP_ARG_sk, cong, 
+					epoch_cwnd[STAP_ARG_i])%}
+		epoch_rtt = %{STAP_MEM_VALUE(STAP_ARG_sk, cong, 
+					epoch_rtt[STAP_ARG_i])%}
+		epoch_cnt = %{STAP_MEM_VALUE(STAP_ARG_sk, cong, 
+					epoch_cnt[STAP_ARG_i])%}
+
+		if (epoch_cnt) {
+			epoch_cwnd /= epoch_cnt
+			epoch_rtt /= epoch_cnt
+		} else
+			epoch_cnt = epoch_cwnd = epoch_rtt = -1
+
+		if (i == 0) prefix = "ep_start_"
+		else if (i == 1) prefix = "ep_steady_"
+		else prefix = "ep_end_"
+
+		printf(",%s=%d,%s=%d,%s=%d",
+			prefix . "cnt", epoch_cnt,
+			prefix . "cwnd", epoch_cwnd,
+			prefix . "rtt", epoch_rtt)
+	}
+}
+
+/* log format: detail */
+function log_detail_cong (sk:long)
+{
+	print(log_detail_slow_start(sk))
+	print(log_detail_cong_avoid(sk))
+}
+
+function log_detail_slow_start:string (sk:long)
+%{
+	struct sock *sk = (struct sock *)STAP_ARG_sk;
+	struct stap_info *info = sk->sk_protinfo;
+	struct stap_cong *c = info->cong;
+	int i, len = 0, flag = 1, maxlen = MAXSTRINGLEN;
+	char *buf = (char *)STAP_RETVALUE;
+	static const char *ss_name[4] = {
+		"Standard",
+		"ACK Train Length",
+		"Delay Increase",
+		"Abort"
+	};
+
+	if (c->fl_cwnd)
+		len = snprintf(buf, maxlen,
+			"%-18s %-10s %-10s %-10s\n%-18s %-10s %-10d %-10d\n\n",
+			"FIRST LOSS TABLE", "phase", "cwnd", "rtt", "",
+			c->fl_phase ? "cong" : "ss", c->fl_cwnd, c->fl_rtt);
+
+	for (i = 0; i < 4; i++) {
+		if (!c->ss_cnt[i])
+			continue;
+
+		if (flag) {
+			len += snprintf(buf + len, maxlen - len,
+				"%-18s %-10s %-10s %-10s %-10s\n", "SLOW START TABLE",
+				"count", "s_cwnd", "e_cwnd", "time(RTT)");
+			flag = 0;
+		}
+
+		len += snprintf(buf + len, maxlen - len,
+			"%-18s %-10u %-10u %-10u %-10u\n", ss_name[i], 
+			c->ss_cnt[i], c->ss_start_cwnd[i] / c->ss_cnt[i], 
+			c->ss_end_cwnd[i] / c->ss_cnt[i], 
+			c->ss_time[i] / c->ss_cnt[i]);
+	}
+
+	if (!flag)
+		snprintf(buf + len, maxlen - len, "\n");
+%}
+
+function log_detail_cong_avoid:string (sk:long)
+%{
+	struct sock *sk = (struct sock *)STAP_ARG_sk;
+	struct stap_info *info = sk->sk_protinfo;
+	struct stap_cong *c = info->cong;
+	int i, len = 0, flag = 1, maxlen = MAXSTRINGLEN;
+	char *buf = (char *)STAP_RETVALUE;
+	static const char *phase_name[3] = 
+		{"epoch", "searching", "probing"};
+	static const char *point_name[3] = 
+		{"start", "steady", "end"};
+
+	for (i = 0; i < 3; i++) {
+		if (!c->phase_cnt[i])
+			continue;
+
+		if (flag) {
+			len = snprintf(buf, maxlen,
+				"%-18s %-10s %-10s\n", "CONG PHASE TABLE", 
+				"count", "time(RTT)");
+			flag = 0;
+		}
+
+		len += snprintf(buf + len, maxlen - len,
+			"%-18s %-10d %-10d\n", phase_name[i], c->phase_cnt[i],
+			c->phase_time[i]);
+	}
+
+	if (!flag) {
+		len += snprintf(buf + len, maxlen - len, "\n");
+		flag = 1;
+	}
+	
+	for (i = 0; i < 3; i++) {
+		if (!c->epoch_cnt[i])
+			continue;
+
+		if (flag) {
+			len += snprintf(buf + len, maxlen - len,
+				"%-18s %-10s %-10s %-10s\n", "CONG POINT TABLE",
+				"count", "cwnd", "rtt");
+			flag = 0;
+		}
+
+		len += snprintf(buf + len, maxlen - len,
+			"%-18s %-10d %-10d %-10d\n", point_name[i],
+			c->epoch_cnt[i], c->epoch_cwnd[i] / c->epoch_cnt[i],
+			c->epoch_rtt[i] / c->epoch_cnt[i]);
+	}
+
+	if (!flag)
+		snprintf(buf + len, maxlen - len, "\n");
+%}
+
+

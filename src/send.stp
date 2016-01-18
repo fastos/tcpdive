@@ -1,0 +1,93 @@
+# Send Routine
+
+%{	
+	#include <linux/tcp.h>
+	#include <net/tcp.h>
+%}
+
+/**
+ * Send data out.
+ */
+probe trans.Send = 
+	kernel.statement("tcp_write_xmit@net/ipv4/tcp_output.c:1785")
+{
+	if (mem_is_stop()) next
+	if (!$sk->sk_protinfo)
+		next
+
+	do_Send($sk, $sent_pkts)
+}
+
+function do_Send(sk:long, cnt:long)
+%{
+	struct sock *sk = (struct sock *)STAP_ARG_sk;
+	struct tcp_sock *tp = tcp_sk(sk);
+	struct stap_info *info = sk->sk_protinfo;
+	struct stap_http *http;
+	struct sk_buff *skb;
+	u32 end_seq;
+
+	info->trans_pkt += STAP_ARG_cnt;
+
+	/* -H option, HTTP performance */
+	if (info->http && info->http_count && STAP_ARG_cnt) {
+		http = info->http + (info->http_count - 1);
+	    if (!http->xmit_resp_ts) {
+			http->xmit_resp_ts = tcp_time_stamp;
+			http->start_seq = tp->snd_una; 
+		}
+	}
+
+	/* Check peer's receive window */
+	if (sk->sk_send_head) {
+		skb = sk->sk_send_head;
+		end_seq = TCP_SKB_CB(skb)->end_seq;
+		if (skb->len > tp->mss_cache)
+			end_seq = TCP_SKB_CB(skb)->seq + tp->mss_cache;
+
+		if (after(end_seq, tp->snd_una + tp->snd_wnd))
+			info->small_swnd++;
+	}
+%}
+
+/**
+ * Log transmission info of a connection.
+ */
+function log_trans (sk:long, state:long)
+{
+	data = get_conn_data(sk)
+	time = get_conn_lifetime(sk)
+	time = time ? time : 1
+
+	trans_pkt = %{STAP_VALUE(STAP_ARG_sk, trans_pkt)%}
+	rtx_synack = %{STAP_VALUE(STAP_ARG_sk, rtx_synack)%}
+	accept_wait = %{STAP_VALUE(STAP_ARG_sk, accept_wait)%}
+	small_swnd = %{STAP_VALUE(STAP_ARG_sk, small_swnd)%}
+	zero_awnd = %{STAP_VALUE(STAP_ARG_sk, zero_awnd)%}
+	rst_flag = %{STAP_VALUE(STAP_ARG_sk, rst_flag)%}
+
+	/* log format: default and detail */
+	if (!%{stap_options.detail_log%}) {
+		printf(",data=%u,time=%u,packet=%u,synack_rtx=%u", 
+			data, time, trans_pkt, rtx_synack)
+		printf(",accept_wait=%u,small_swnd=%u,zero_awnd=%u", 
+			accept_wait, small_swnd, zero_awnd)
+		printf(",rst_flag=%u,from_state=%s,to_state=%s",
+			rst_flag, get_socket_state(sk), 
+			socket_state_num2str(state))
+	} else {
+		printf("TRANS TABLE\n");
+		printf("%-18s %u B\n", "data", data)
+		printf("%-18s %u ms\n", "time", time)
+		printf("%-18s %u pkts\n", "packet", trans_pkt)
+		printf("%-18s %u pkts\n", "synack_rtx", rtx_synack)
+		printf("%-18s %u ms\n", "accept_wait", accept_wait)
+		printf("%-18s %u\n", "small_swnd", small_swnd)
+		printf("%-18s %u\n", "zero_awnd", zero_awnd)
+		printf("%-18s %u\n", "rst_flag", rst_flag)
+		printf("%-18s %s\n", "from_state", get_socket_state(sk))
+		printf("%-18s %s\n", "to_state", socket_state_num2str(state))
+	}
+}
+
+

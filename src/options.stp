@@ -1,0 +1,403 @@
+# Command-line options
+# ice and fire
+
+%{
+	#include <linux/types.h>
+	struct stap_info;
+
+	#define MAX_CONN_FILTERS 5
+	#define MAX_PORT_FILTERS 5
+
+	/* options */
+	struct stap_options_s {
+		u32 bitmap;
+		u32 timeout;
+		u32 lifetime;
+		u32 trans_time;
+		u32 ad_cong;
+		u32 detail_log;
+		u32 sample_ratio;	
+		atomic64_t sample_cnt; 
+	};
+	typedef struct stap_options_s stap_options_t;
+
+	enum {
+		OP_BITMAP = 0,
+		OP_TIMEOUT = 1,
+		OP_LIFETIME = 2,
+		OP_TRANS_TIME = 3,
+		OP_AD_CONG = 4,
+		OP_DETAIL_LOG = 5,
+		OP_SAMPLE_RATIO = 6,
+		OP_MAX = 7
+	};
+
+	static const char *op_names[OP_MAX] = {
+		"bitmap",
+		"timeout",
+		"lifetime",
+		"trans_time",
+		"ad_cong",
+		"detail_log",
+		"sample_ratio"
+	};
+
+	/* connection filter */
+    struct conn_filter_s {
+		u32 laddr;
+		u32 laddr_mask;
+		u32 raddr;
+		u32 raddr_mask;
+		u16 lport;
+		u16 rport;
+	};
+	typedef struct conn_filter_s conn_filter_t;
+	
+	typedef struct {
+		u32 num;
+		conn_filter_t filters[MAX_CONN_FILTERS];
+	} conn_filters_t;
+
+	/* port filter */
+	typedef struct {
+		u16 num;
+		u16 ports[MAX_PORT_FILTERS];
+	} port_filters_t;
+
+	/* global vars */
+	static conn_filters_t conn_filters;
+	static port_filters_t port_filters;
+	stap_options_t stap_options;
+%}
+
+/**
+ * Allow setting port filters by module argument.
+ */
+global port_str = ""
+
+/** 
+ * Parse cmdline arguments.
+ * Note: conn filter should be the last argument.
+ */
+function process_cmdline:long ()
+{
+	flag = 1
+	ret = 0
+	
+	if (port_str != "")
+		init_port_filter(port_str)
+
+	for (i = 1; i <= argc; i++) {
+		name = tokenize(argv[i], "=")
+
+		if (flag && (idx = is_stap_option(name)) >= 0) {
+			argv[i] = ""
+			value = strtol(tokenize(argv[i], "="), 10)
+			init_stap_option(idx, value)
+			continue
+		}
+
+		if (flag && name == "ports") {
+			argv[i] = ""
+			ports = tokenize(argv[i], "=")
+			init_port_filter(ports)
+			continue
+		}
+
+		flag = 0
+		if ((ret = init_conn_filter(i)) < 0)
+			break
+	}
+
+	return ret
+}
+
+function is_stap_option:long (name:string)
+%{
+	int j, ret = -1;
+
+	for(j = 0; j < OP_MAX; j++)
+		if (strcmp(STAP_ARG_name, op_names[j]) == 0) {
+			ret = j;
+			break;
+		}
+
+	STAP_RETVALUE = ret;
+%}
+
+function init_stap_option (idx:long, value:long)
+%{
+	((u32 *)&stap_options)[STAP_ARG_idx] = STAP_ARG_value;
+%}
+
+function take_sample:long ()
+%{
+	int ret = 0;
+
+	if (!stap_options.sample_ratio)
+		ret = 1;
+	else {
+		atomic64_inc(&stap_options.sample_cnt);
+		ret = !(atomic64_read(&stap_options.sample_cnt) % 
+			stap_options.sample_ratio);
+	}
+
+	STAP_RETVALUE = ret;
+%}
+
+/** 
+ * port filter, -p option.
+ */
+function init_port_filter (ports:string)
+{
+	while (strlen(buf = tokenize(ports, ",")) != 0) {
+		port = strtol(buf, 10)
+		ports = ""
+
+		if (set_port_filter(port) < 0)
+			break
+	}
+}
+
+function set_port_filter:long (port:long)
+%{
+	int ret = 0;
+
+	if (STAP_ARG_port > 0xffff || port_filters.num >= MAX_PORT_FILTERS)
+		ret = -1;
+	else 
+		port_filters.ports[port_filters.num++] = STAP_ARG_port;
+	
+	STAP_RETVALUE = ret;
+%}
+
+function use_port_filter:long (sk:long)
+{
+	lport = tcpmib_local_port(sk)
+	return do_port_filter(lport)
+}
+
+function do_port_filter:long (port:long)
+%{
+	int i, ret = 0;
+
+	if (!port_filters.num)
+		ret = 1;
+	else {
+		for (i = 0; i < port_filters.num; i++)
+			if (STAP_ARG_port == port_filters.ports[i]){
+				ret = 1;
+				break;
+			}
+	}
+
+	STAP_RETVALUE = ret;
+%}
+
+/* Filter API */
+function filter:long (sk:long)
+{
+	/* Neither conn filter nor port filter is used */
+	if (!%{conn_filters.num | port_filters.num%})
+		return 1
+
+	/* Both conn filter and port filter are used */
+	if (%{conn_filters.num & port_filters.num%})
+		return (use_port_filter(sk) && use_conn_filter(sk))
+
+	/* Only port filter is used */
+	if (%{port_filters.num%})
+		return use_port_filter(sk)
+
+	/* Only conn filter is used */
+	if (%{conn_filters.num%})
+		return use_conn_filter(sk)
+}
+
+/**
+ * connection filter, -f option.
+ */
+function init_conn_filter:long (idx:long)
+{
+	local = tokenize(argv[idx], "-")
+	argv[idx] = ""
+	remote = tokenize(argv[idx], "-")
+
+	local_addr = tokenize(local, ":")
+	local = ""
+	local_port = tokenize(local, ":")
+
+	remote_addr = tokenize(remote, ":")
+	remote = ""
+	remote_port = tokenize(remote, ":")
+
+	laddr = ipv4_pton(local_addr, 0)
+	laddr_mask = ipv4_pton(local_addr, 1)
+	lport = ipv4_portton(local_port)
+
+	raddr = ipv4_pton(remote_addr, 0)
+	raddr_mask = ipv4_pton(remote_addr, 1)
+	rport = ipv4_portton(remote_port)
+
+	if (laddr < 0 || laddr_mask < 0 ||
+		raddr < 0 || raddr_mask < 0 ||
+		lport < 0 || rport < 0)
+		return -1
+
+	if (set_conn_filter(laddr, laddr_mask, lport, 
+			raddr, raddr_mask, rport) < 0)
+		return -1
+
+	return 0
+}
+
+function set_conn_filter:long (laddr:long, laddr_mask:long, 
+	lport:long, raddr:long, raddr_mask:long, rport:long)
+%{
+	u32 cnt = conn_filters.num;
+	conn_filter_t *filter;
+
+	if (cnt >= MAX_CONN_FILTERS) {
+		STAP_RETVALUE = -1;
+		return;
+	}
+	
+	filter = &conn_filters.filters[cnt];
+	filter->laddr = STAP_ARG_laddr;
+	filter->laddr_mask = STAP_ARG_laddr_mask;
+	filter->lport = STAP_ARG_lport;
+	filter->raddr = STAP_ARG_raddr;
+	filter->raddr_mask = STAP_ARG_raddr_mask;
+	filter->rport = STAP_ARG_rport;
+	conn_filters.num++;
+
+	STAP_RETVALUE = 0;
+%}
+
+/*
+ * Convert an ipv4 dot notation address into long.
+ * Support "*" in any field, treating it as a wildcard
+ * by making the byte = 0. If make_mask is set, it creates
+ * a mask based on "*" fields. All non = "*" bytes are
+ * set to 0xff, all "*" fields are set to 0x0.
+ */
+function ipv4_pton:long (addr:string, make_mask:long)
+{
+	i = 32
+	ip = 0
+	ips = addr
+
+	while (strlen(byte = tokenize(ips, ".")) != 0) {
+		i -= 8
+		ips = ""
+
+		if (byte == "*") {
+			byte = "0"
+		} else if (make_mask)
+			byte = "255"
+
+		j = strtol(byte, 10)
+		if (j > 0xff)
+			return -1
+
+		ip = ip + (j << i)
+	}
+
+	if (i != 0)
+		return -1
+
+	return ip
+}
+
+/*
+ * Convert an ascii integer between 0 and 0xffff to a
+ * u16 port number. "*" is treated as a wildcard and 
+ * will be converted to 0x0.
+ */
+function ipv4_portton:long (port:string)
+{
+	if (port == "*")
+		port = "0"
+
+	digit = strtol(port, 10)
+	if (digit > 0xffff)
+		return -1
+
+	return digit
+}
+
+/*
+ * Do connection filtering.
+ * On success return 1, else return 0.
+ */
+function use_conn_filter:long (sk:long)
+{
+	laddr = tcpmib_local_addr(sk)
+	lport = tcpmib_local_port(sk)
+	raddr = tcpmib_remote_addr(sk)
+	rport = tcpmib_remote_port(sk)
+
+	return do_conn_filter(laddr, lport, raddr, rport)
+}
+
+function do_conn_filter:long (laddr:long, lport:long, 
+	raddr:long, rport:long)
+%{
+	int local_valid, remote_valid;
+	conn_filter_t filter;
+	int i, ret = 0;
+
+	if (!conn_filters.num) {
+		STAP_RETVALUE = 1;
+		return;
+	}
+
+	for (i = 0; i < conn_filters.num; i++) {
+		local_valid = remote_valid = 0;
+		filter = conn_filters.filters[i];
+
+		/* filter local ip and local port */
+		if ((STAP_ARG_laddr & filter.laddr_mask) == filter.laddr) {
+			if (!filter.lport || (STAP_ARG_lport == filter.lport))
+				local_valid = 1;
+		}
+
+		/* filter remote ip and remote port */
+		if ((STAP_ARG_raddr & filter.raddr_mask) == filter.raddr) {
+			if (!filter.rport || (STAP_ARG_rport == filter.rport))
+				remote_valid = 1;
+		}
+
+		if (local_valid && remote_valid) {
+			ret = 1;
+			break;
+		}
+	}
+
+	STAP_RETVALUE = ret;
+%}
+
+/**
+ * stop itself after running specified secs.
+ */
+function stap_update_timer:long (delta:long)
+%{
+	stap_options.timeout -= STAP_ARG_delta;
+	STAP_RETVALUE = stap_options.timeout;
+%}
+
+probe timer.s(1)
+{
+	if (%{stap_options.timeout%} == 0)
+		next
+
+	if (stap_update_timer(1) == 0 &&
+		!mem_is_stop()) {
+		mem_set_stop()
+		mem_free_active()
+
+		exit()
+	}
+}
+
+

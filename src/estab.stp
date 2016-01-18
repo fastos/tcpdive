@@ -1,0 +1,88 @@
+# Establishment, a place to begin 
+
+%{
+	#include <net/tcp.h>
+	#include <linux/rtc.h>
+	#include <linux/timer.h>
+
+	struct stap_info;
+%}
+
+/**
+ * When a connection is established.
+ */
+probe estab.Estab = 
+	kernel.statement("tcp_rcv_state_process@net/ipv4/tcp_input.c:5830")
+{
+	if (mem_is_stop()) next
+	if (!filter($sk)) next
+	if (!take_sample()) next
+
+	if (mem_alloc($sk)) {
+		printf("mem_alloc failed!\n")
+		next
+	}
+
+	do_Estab($sk)
+}
+
+function do_Estab(sk:long)
+%{
+	struct sock *sk = (struct sock *)STAP_ARG_sk;
+	struct tcp_sock *tp = tcp_sk(sk);
+	struct inet_connection_sock *icsk = inet_csk(sk);
+	struct stap_info *info = sk->sk_protinfo;
+	struct stap_cong *cong;
+	struct timeval tv;
+	unsigned long time;
+
+	if (!info)
+		return;
+
+	/* Init vars */
+	info->estab_t = tcp_time_stamp;
+	info->isn = tp->snd_nxt;
+	info->rtx_synack = tp->total_retrans;
+	atomic_set(&info->freeing, 0); 
+
+	/* Record estab time */
+	do_gettimeofday(&tv);
+	time = tv.tv_sec + 8 * 3600;
+	rtc_time_to_tm(time, &info->tm);
+
+	/* Advanced CC */
+	cong = info->cong;
+	if (cong && (stap_options.bitmap & STAPF_ADCONG)) {
+		cong->adcong_flag = 1;
+		atomic_set(&cong->adcong_cnt, 0);
+	}
+%}
+
+/** 
+ * When a connection is accepted.
+ */
+probe estab.Accept = 
+	kernel.function("inet_csk_accept").return
+{
+	if (mem_is_stop()) next
+	sk = $return
+	if (!sk) next
+	
+	do_Accept(sk)
+}
+
+function do_Accept(sk:long)
+%{
+	struct sock *sk = (struct sock *)STAP_ARG_sk;
+	struct tcp_sock *tp = tcp_sk(sk);
+	struct stap_info *info = sk->sk_protinfo;
+
+	if (!info)
+		return;
+
+	info->accept_wait = tcp_time_stamp - info->estab_t;
+	info->init_cwnd = tp->snd_cwnd;
+	info->init_ssthr = tp->snd_ssthresh;
+%}
+
+

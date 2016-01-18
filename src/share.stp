@@ -1,0 +1,101 @@
+# functions shared by serveral modules
+
+%{	
+	#include <linux/tcp.h>
+	#include <net/tcp.h>
+
+	static const char tcp_state_array[][16] = {
+		"NULL",
+		"ESTABLISHED",
+		"SYN_SENT",
+		"SYN_RECV",
+		"FIN_WAIT1",
+		"FIN_WAIT2",
+		"TIME_WAIT",
+		"CLOSE",
+		"CLOSE_WAIT",
+		"LAST_ACK",
+		"LISTEN",
+		"CLOSING"
+	};
+%}
+
+function get_short_time:string()
+%{
+	struct timeval tv;
+	struct rtc_time tm;
+	unsigned long time;
+
+	do_gettimeofday(&tv);
+	time = tv.tv_sec + 8 * 3600;
+	rtc_time_to_tm(time, &tm);
+
+	sprintf(STAP_RETVALUE, "%02d:%02d:%02d", 
+		tm.tm_hour, tm.tm_min, tm.tm_sec);
+%}
+
+function get_full_time:string()
+%{
+	struct timeval tv;
+	struct rtc_time tm;
+	unsigned long time;
+
+	do_gettimeofday(&tv);
+	time = tv.tv_sec + 8 * 3600;
+	rtc_time_to_tm(time, &tm);
+
+	sprintf(STAP_RETVALUE, "%d/%d/%d,%02d:%02d:%02d",
+		tm.tm_year+1900, tm.tm_mon+1, tm.tm_mday, 
+		tm.tm_hour, tm.tm_min, tm.tm_sec);
+%}
+
+function get_conn_lifetime:long (sk:long)
+%{
+	struct sock *sk = (struct sock *)STAP_ARG_sk;
+	struct stap_info *info = sk->sk_protinfo;
+	STAP_RETVALUE = jiffies_to_msecs(tcp_time_stamp - info->estab_t);
+%}
+
+function get_conn_data:long (sk:long)
+%{
+	struct sock *sk = (struct sock *)STAP_ARG_sk;
+	struct tcp_sock *tp = tcp_sk(sk);
+	struct stap_info *info = sk->sk_protinfo;
+	u32 len = tp->snd_nxt - info->isn;
+
+	STAP_RETVALUE = len ? len - 1 : len;
+%}
+
+function filter_http_transtime:long (sk:long)
+%{
+	struct sock *sk = (struct sock *)STAP_ARG_sk;
+	struct stap_info *info = sk->sk_protinfo;
+
+	STAP_RETVALUE = info->http_filter; 
+%}
+
+function get_socket_addr:string (sk:long)
+{
+	laddr = tcpmib_local_addr(sk)
+	lport = tcpmib_local_port(sk)
+	raddr = tcpmib_remote_addr(sk)
+	rport = tcpmib_remote_port(sk)
+
+	local_addr = sprintf("%s:%d", ip_ntop(htonl(laddr)), lport)
+	remote_addr = sprintf("%s:%d", ip_ntop(htonl(raddr)), rport)
+
+	return sprintf("local=%s,remote=%s", local_addr, remote_addr)
+}
+
+function get_socket_state:string (sk:long)
+%{
+	struct sock *sk = (struct sock *)STAP_ARG_sk;
+	sprintf(STAP_RETVALUE, "%s", tcp_state_array[sk->sk_state]);
+%}
+
+function socket_state_num2str:string (state:long)
+%{
+	sprintf(STAP_RETVALUE, "%s", tcp_state_array[STAP_ARG_state]);
+%}
+
+

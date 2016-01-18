@@ -1,0 +1,133 @@
+# Close
+# log stap_info right before connection being closed.
+
+%{
+	#include <net/tcp.h>
+	#include <linux/timer.h>
+
+	struct stap_info;
+%}
+
+/** 
+ * When a connection is closing.
+ */
+probe close.Close = 
+	kernel.function("tcp_set_state")
+{
+	if (!$sk || !$sk->sk_protinfo)
+		next
+
+	new_state = $state
+	if (new_state == %{TCP_CLOSE%} ||
+		new_state == %{TCP_FIN_WAIT2%}) {
+		if (!mem_is_stop()) {
+			check_rst($sk, new_state)
+			close_update($sk)
+
+			if (filter_output($sk)) {
+				/* Default */
+				log_conn_id($sk)
+				log_trans($sk, new_state)
+				log_cwnd_ssthr($sk)
+				log_rtt_rto($sk)
+
+				/* Optional */
+				log_retrans($sk)
+				log_cong($sk)
+				log_http($sk)
+				printf("\n")
+			}
+		}
+
+		mem_free($sk)
+	} 
+}
+
+function filter_output:long (sk:long)
+{
+	ret = 1
+
+	if (%{stap_options.bitmap & STAPF_HTTP%})
+		ret &=  filter_http_transtime(sk)
+
+	ret &= filter_conn_lifetime(sk)
+
+	return ret
+}
+
+function filter_conn_lifetime:long (sk:long)
+{
+	return get_conn_lifetime(sk) >= %{stap_options.lifetime%}
+}
+
+function close_update(sk:long)
+{
+	cwnd_ssthr_update(sk)
+	cong_close_update(sk)	
+}
+
+function cwnd_ssthr_update(sk:long)
+%{
+	struct sock *sk = (struct sock *)STAP_ARG_sk;
+	struct stap_info *info = sk->sk_protinfo;
+	struct tcp_sock *tp = tcp_sk(sk);
+
+	info->end_cwnd = tp->snd_cwnd;
+	info->end_ssthr = tp->snd_ssthresh;
+%}
+
+/** 
+ * Make sure memory being freed in any condition.
+ */
+probe close.Destruct = 
+	kernel.function("inet_sock_destruct")
+{
+	if (!$sk->sk_protinfo)
+		next
+
+	mem_free($sk)
+}
+
+/**
+ * Capture signal SIGINT and SIGTERM to quit.
+ */
+probe close.Signal = 
+	signal.send
+{
+	if (!mem_is_stop() &&
+		(sig_name == "SIGINT" || sig_name == "SIGTERM")
+			&& pid_name == "stapio") {
+		mem_set_stop()
+		mem_free_active()	
+	}
+}
+
+/**
+ * Log ID of a connection.
+ */
+function log_conn_id (sk:long)
+{
+	tm_year = %{STAP_VALUE(STAP_ARG_sk, tm).tm_year%}
+	tm_mon = %{STAP_VALUE(STAP_ARG_sk, tm).tm_mon%}
+	tm_mday = %{STAP_VALUE(STAP_ARG_sk, tm).tm_mday%}
+	tm_hour = %{STAP_VALUE(STAP_ARG_sk, tm).tm_hour%}
+	tm_min = %{STAP_VALUE(STAP_ARG_sk, tm).tm_min%}
+	tm_sec = %{STAP_VALUE(STAP_ARG_sk, tm).tm_sec%}
+	isn = %{STAP_VALUE(STAP_ARG_sk, isn)%}
+
+	time = sprintf("%d/%d/%d,start=%02d:%02d:%02d,end=%s",
+		tm_year+1900, tm_mon+1, tm_mday, tm_hour, tm_min, tm_sec, 
+		get_short_time())	
+
+	addr = get_socket_addr(sk)
+
+	if (%{stap_options.detail_log%}) {
+		line = "====================================="
+		printf("%s%s\n", line, line)
+		printf("%s,id=%u\n%s\n\n", time, isn, addr)
+	} else {
+		printf("%s,%s,id=%u", time, addr, isn)
+	}
+}
+
+

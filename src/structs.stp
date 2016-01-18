@@ -1,0 +1,185 @@
+# Data Structure
+# What stap_info is to TcpDive is what sk_buff to TCP/IP.
+
+%{
+	#include <net/tcp.h>
+	#include <linux/rtc.h>
+	#include <linux/timer.h>
+
+	struct stap_info {
+	    /* Summary, default */
+		u32 estab_t;                        /* Establish time of a connection */
+		struct rtc_time tm;                 /* Date of the connection */
+		u32 isn;                            /* for transmission data counting */
+		u32 rtx_synack;                     /* SYNACK retrans times */
+		u32 trans_pkt;                      /* Transmission pkts */
+		u32 accept_wait;                    /* wait time before being accepted */
+		u32 small_swnd;                     /* snd_wnd less than MSS */
+		u32 zero_awnd;                      /* peer's advertise window is zero */
+		u32 rst_flag;                       /* send or receive a RST */
+		atomic_t freeing;                   /* A flag to avoid reentry of mem free */
+
+		/* RTT and RTO, default */
+		u32 rtt[3];                         /* min, avg, max RTT */
+		u32 rto[3];                         /* min, avg, max RTO */
+		u32 rto_cnt;                        /* for calculating average rto */
+		u32 rtt_cnt;                        /* for calculating average rtt */
+
+		/* cwnd and ssthresh, default */
+		u32 init_cwnd;                      /* initial cwnd */
+		u32 end_cwnd;                       /* cwnd at the end of connection */
+		u32 init_ssthr;                     /* initial ssthresh */
+		u32 end_ssthr;                      /* sstresh at the end of connection */
+
+		/* HTTP info, -H option */
+		u32 http_count;                     /* HTTP req/resp count */
+		u32 http_alloc;			            /* HTTP structs alloc */
+		u32 http_offset;		            /* Temp var */
+		u32 http_filter;		            /* A flag to control output */
+		struct stap_http *http;             /* HTTP req/resp queue */
+
+		/* Other options */
+		struct stap_retrans *retrans;       /* Loss and Retransmission, -L option */
+		struct stap_cong *cong;             /* Congestion control, -C option */
+	};
+
+    /* HTTP req/resp info */
+	struct stap_http {
+		struct rtc_time tm;                 /* Date of request */
+		u32 rcv_req_ts;                     /* HTTP request recv ts */
+		u32 xmit_resp_ts;                   /* HTTP response start xmit ts */
+		u32 last_ack_ts;                    /* HTTP response finish xmit ts */
+		u32 start_seq;                      /* HTTP response start sequence */
+		u32 end_snd_una;                    /* HTTP response end sequence received */
+	};
+
+	/* Loss and Retransmission */
+	struct stap_retrans {
+		/* Retrans events */
+		u32 fr_ev;                          /* Fast recovery event */ 
+		u32 to_ev;                          /* Timeout event */
+		u32 to_ev_distr[5];                 /* Timeout event distribution */
+
+		/* Retrans packets */
+		u32 fr_rp;                          /* Fast recovery retrans pkt */
+		u32 to_rp;                          /* Timeout recovery retrans pkt */
+		u32 to_rp_distr[5];                 /* Timeout retrans pkt distribution */
+
+		/* Retrans recovery time */
+		u32 fr_rt;                          /* Fast recovery time */
+		u32 to_rt;                          /* Timeout recovery time */
+		u32 to_rt_distr[5];                 /* Timeout recovery time distribution */
+
+		/* Retrans waiting time */
+		u32 fr_wt;                          /* Wait time before entering fast recovery */
+		u32 to_wt;                          /* Wait time before entering timeout */
+		u32 to_wt_distr[5];                 /* Wait time before entering timeout distribution */
+
+		/* Retrans undo events */
+		u32 fr_undo;                        /* Fast recovery is spurious */
+		u32 to_undo;                        /* Timeout recovery is spurious */
+
+		/* Intermediate vars */
+		u32 ca_bf_to;                       /* ca state just before timeout */		
+		u32 fr_s_t;                         /* timestap when fast recovery starts */
+		u32 to_s_t;                         /* timestap when timeout recovery starts */
+	};
+
+	/* Congestion control */
+	struct stap_cong {
+		/* Summary */
+		u32 cwnd_unlimit;                   /* times when tcp is no cwnd limited */
+		u32 fast_converg;                   /* fast covergence performed times */
+
+		/* First loss */
+		u32 fl_phase;                       /* in which phase, 0:ss, 1:cong */
+		u32 fl_cwnd;                        /* cwnd at first loss */
+		u32 fl_rtt;                         /* rtt at first loss */
+
+		/* Slow Start
+		 * 0 - Standard
+		 * 1 - ACK Train Length
+		 * 2 - Delay Increase
+		 * 3 - Abort due to loss
+		 */
+		u32 ss_cnt[4];                      /* slow start count */
+		u32 ss_time[4];                     /* avg time used, unit is RTT */
+		u32 ss_start_cwnd[4];               /* avg cwnd when enter slow start */
+		u32 ss_end_cwnd[4];                 /* avg cwnd when exit slow start */
+
+		/* Congestion Avoid */
+		/* phase_cnt and phase_time:
+		 * 0 - epoch
+		 * 1 - searching
+		 * 2 - probing
+		 * epoch_cwnd, epoch_rtt and epoch_cnt:
+		 * 0 - start
+		 * 1 - steady
+		 * 2 - end
+		 */
+		u32 phase_cnt[3];                   /* phase {epoch|search|probe} counts */
+		u32 phase_time[3];                  /* phase {epoch|search|probe} time */
+		u32 epoch_cwnd[3];                  /* epoch {start|steady|end} cwnd */
+		u32 epoch_rtt[3];                   /* epoch {start|steady|end} rtt */
+		u32 epoch_cnt[3];                   /* epoch {start|steady|end} count */
+
+		/* Advanced CC option, -A */
+		atomic_t adcong_cnt;                /* point count */
+		u16 adcong_flag;                    /* on or off */
+		u8 adcong_point;                    /* point type */
+		u8 adcong_msg;                      /* point msg */
+
+		/* Temp vars */
+		u32 ss_running;                     /* in slow start  */
+		u32 ss_enter_cwnd;                  /* cwnd when entering slow start */
+		u32 ss_rtt_cnt;                     /* for slow start time measurement */
+		u32 epoch_switch;                   /* epoch phase switch flag */
+		u32 epoch_switch_ts;                /* epoch phase switch timestamp */
+	};
+
+	enum {
+		STAP_RETRANS = 1,
+		STAP_HTTP = 2,
+		STAP_CONG = 3,
+		STAP_RST = 4,
+		STAP_ADCONG = 5
+	};
+
+	enum {
+		STAPF_RETRANS = (1 << 1),
+		STAPF_HTTP = (1 << 2),
+		STAPF_CONG = (1 << 3),
+		STAPF_RST = (1 << 4),
+		STAPF_ADCONG = (1 << 5)
+	};
+
+	#define INIT_VALUE ((unsigned)(-1))
+
+	#define STAP_VALUE(sk, name) \
+		(((struct stap_info *)((struct sock *) \
+			sk)->sk_protinfo)->name)
+
+	#define STAP_MEM_VALUE(sk, mem, name) \
+		(((struct stap_info *)((struct sock *) \
+			sk)->sk_protinfo)->mem->name)
+
+	#define STAP_HTTP_VALUE(addr, name) \
+		(((struct stap_http *)addr)->name)
+
+	#define STAP_HTTP_MEM_VALUE(addr, mem, name) \
+		(((struct stap_http *)addr)->mem.name)
+
+    /* Number of HTTP request structs pre allocated.
+	 * With HTTP Keepalive enabled, a value greater than one is suggested.
+	 */
+	#define STAP_HTTP_INIT_CNT 1
+
+	/* Max number of HTTP request structs that a connection can use.
+	 * Prevent too much memory consumed by one connection.
+	 */
+	#define STAP_HTTP_MAX_CNT 10000
+%}
+
+function structs_init () {}
+
+

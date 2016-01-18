@@ -1,0 +1,56 @@
+# Monitor Reset packets
+
+%{
+	#include <linux/tcp.h>
+	#include <net/tcp.h>
+%}
+
+/**
+ * Send Active RST.
+ */
+probe rst.ActiveSend = 
+	kernel.function("tcp_send_active_reset")
+{
+	if (!filter($sk))
+		next
+	
+	do_ActiveSend($sk)	
+}
+
+function do_ActiveSend(sk:long)
+{
+	printf("[TX RST],%s,%s\n", 
+		get_full_time(), get_socket_addr(sk))
+}
+
+/**
+ * Receive RST.
+ */
+probe rst.Recv = 
+	kernel.function("tcp_reset")
+{
+	if (!filter($sk))
+		next
+	
+	do_RstRecv($sk)
+}
+
+function do_RstRecv(sk:long)
+{
+	printf("[RX RST],%s,%s,state=%s\n", 
+		get_full_time(), get_socket_addr(sk), 
+		get_socket_state(sk))
+}
+
+function check_rst(sk:long, state:long)
+%{
+	struct sock *sk = (struct sock *)STAP_ARG_sk;
+	struct stap_info *info = sk->sk_protinfo;
+	u32 new_state = STAP_ARG_state;
+
+	if (sk->sk_state == TCP_ESTABLISHED &&
+		new_state == TCP_CLOSE)
+		info->rst_flag = 1;
+%}
+
+

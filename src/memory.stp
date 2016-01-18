@@ -1,0 +1,230 @@
+# Memory management
+
+%{
+	#include <linux/slab.h>
+	#include <net/inet_hashtables.h>
+
+	extern struct inet_hashinfo tcp_hashinfo;
+	
+	typedef struct {
+		atomic64_t info;
+		atomic64_t retrans;
+		atomic64_t http;
+		atomic64_t cong;
+	} mem_stat_t;
+
+	typedef struct {
+		int info;
+		int retrans;
+		int http;
+		int cong;
+	} active_mem_stat_t;
+
+	struct stap_mem_s {
+		atomic_t stop_alloc;
+		mem_stat_t alloc;
+		mem_stat_t free;
+		active_mem_stat_t active_free;
+	};
+	typedef struct stap_mem_s stap_mem_t;
+
+	/* Memory statistics */
+	stap_mem_t stap_mem;
+
+
+	void do_mem_free(struct sock *sk, int active)
+	{
+		struct stap_info *info = sk->sk_protinfo;
+		mem_stat_t *free = &stap_mem.free;
+		active_mem_stat_t *active_free = &stap_mem.active_free;
+
+		if (!info)
+			return;
+
+		if (!atomic_add_unless(&info->freeing, 1, 1))
+			return;
+
+		if (info->retrans) {
+			kfree(info->retrans);
+			info->retrans = NULL;
+
+			if (active)
+				active_free->retrans++;
+			else
+				atomic64_inc(&free->retrans);
+		}
+
+		if (info->cong) {
+			kfree(info->cong);
+			info->cong = NULL;
+
+			if (active)
+				active_free->cong++;
+			else
+				atomic64_inc(&free->cong);
+		}
+
+		if (info->http) {
+			kfree(info->http);
+			info->http = NULL;
+
+			if (active)
+				active_free->http += info->http_alloc; 
+			else
+				atomic64_add(info->http_alloc, &free->http);
+		}
+
+		kfree(info);
+		sk->sk_protinfo = NULL;
+
+		if (active)
+			active_free->info++;
+		else
+			atomic64_inc(&free->info);
+	}
+%}
+
+function mem_alloc:long (sk:long)
+%{
+	struct sock *sk = (struct sock *)STAP_ARG_sk;
+	struct stap_info *info;
+	gfp_t flags = GFP_ATOMIC | __GFP_ZERO;
+	mem_stat_t *alloc = &stap_mem.alloc;
+	void *ptr;
+	
+	STAP_RETVALUE = 0;
+	if (atomic_read(&stap_mem.stop_alloc))
+		return;
+		
+	ptr = kmalloc(sizeof(struct stap_info), flags);
+	if (ptr == NULL)
+		goto FAILED;
+		
+	sk->sk_protinfo = ptr;
+	info = ptr;
+	atomic64_inc(&alloc->info);
+
+	if (stap_options.bitmap & STAPF_RETRANS) {
+		ptr = kmalloc(sizeof(struct stap_retrans), flags);
+		if (ptr == NULL)
+			goto FAILED;
+
+		info->retrans = ptr;
+		atomic64_inc(&alloc->retrans);
+	}
+
+	if (stap_options.bitmap & (STAPF_CONG | STAPF_ADCONG)) {
+		ptr = kmalloc(sizeof(struct stap_cong), flags);
+		if (ptr == NULL)
+			goto FAILED;
+
+		info->cong = ptr;
+		atomic64_inc(&alloc->cong);
+	}
+
+	if (stap_options.bitmap & STAPF_HTTP) {
+		ptr = kmalloc(sizeof(struct stap_http) * STAP_HTTP_INIT_CNT, 
+				flags);
+		if (ptr == NULL)
+			goto FAILED;
+
+		info->http = ptr;
+		info->http_alloc = STAP_HTTP_INIT_CNT;
+		atomic64_add(STAP_HTTP_INIT_CNT, &alloc->http);	
+	}
+
+	return;
+
+FAILED:
+	do_mem_free(sk, 0);
+	STAP_RETVALUE = 1;
+%}
+
+/* After being informed of exit by signal or timer,
+ * it should not allocate any more memory.
+ */
+function mem_set_stop ()
+%{
+	atomic_set(&stap_mem.stop_alloc, 1);
+%}
+
+function mem_is_stop:long ()
+%{
+	STAP_RETVALUE = atomic_read(&stap_mem.stop_alloc);
+%}
+
+function mem_free(sk:long)
+%{
+	struct sock * sk = (struct sock *)STAP_ARG_sk;
+	struct stap_info *info = sk->sk_protinfo;
+
+	do_mem_free(sk, 0);
+%}
+
+function mem_free_active()
+%{
+	struct inet_hashinfo *hashinfo = &tcp_hashinfo;
+	struct inet_ehash_bucket *head;
+	struct hlist_nulls_node *node;
+	struct sock *sk;
+	spinlock_t *lock;
+	int i;
+
+	for (i = 0; i < hashinfo->ehash_size; i++)
+	{
+		head = &hashinfo->ehash[i];
+		lock = inet_ehash_lockp(hashinfo, i);
+
+		if (hlist_nulls_empty(&head->chain))
+			continue;
+
+		spin_lock(lock);
+		sk_nulls_for_each(sk, node, &head->chain)
+		{
+			if (sk->sk_protinfo) {
+				do_mem_free(sk, 1);
+			}
+		}
+		spin_unlock(lock);
+	}
+%}
+
+/** 
+ * Log memory usage 
+ */
+function mem_log:string (idx:long)
+%{
+	int alloc, free, active, active_free, leak;
+	int idx = STAP_ARG_idx;
+
+	alloc = atomic64_read(&((atomic64_t *)&stap_mem.alloc)[idx]);
+	free = atomic64_read(&((atomic64_t *)&stap_mem.free)[idx]);
+	active_free = ((int *)&stap_mem.active_free)[idx];
+	active = alloc - free;
+	leak = active - active_free;
+
+	snprintf(STAP_RETVALUE, MAXSTRINGLEN,
+		"%-14d%-14d%-14d%-14d%-14d", alloc, free, active, 
+		active_free, leak);
+%}
+
+function log_mem_usage()
+{
+	printf("%-20s%-14s%-14s%-14s%-14s%-14s\n", "Memory Usage",
+		"alloc", "free", "active", "active_free", "leak")
+
+	printf("%-20s%s\n", "stap_info", mem_log(0))
+
+	if (%{stap_options.bitmap%} & %{STAPF_RETRANS%})
+		printf("%-20s%s\n", "stap_retrans", mem_log(1))
+
+	if (%{stap_options.bitmap%} & %{STAPF_HTTP%})
+		printf("%-20s%s\n", "stap_http", mem_log(2))
+
+	if (%{stap_options.bitmap & (STAPF_CONG | STAPF_ADCONG)%})
+		printf("%-20s%s\n", "stap_cong", mem_log(3))
+	
+	printf("\n")
+}
+
+

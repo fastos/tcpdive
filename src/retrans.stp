@@ -1,0 +1,320 @@
+# Loss and Retransmission
+
+%{
+	#include <linux/tcp.h>
+	#include <net/tcp.h>
+
+	#define CA_STATE_NUM 5
+	static const char *ca_state_name[CA_STATE_NUM] = {
+		"Open",
+		"Disorder",
+		"CWR",
+		"Recovery",
+		"Loss"
+	};
+
+	static int stap_tcp_packet_delayed(struct tcp_sock *tp)
+	{
+		return !tp->retrans_stamp ||
+			(tp->rx_opt.saw_tstamp && tp->rx_opt.rcv_tsecr &&
+			before(tp->rx_opt.rcv_tsecr, tp->retrans_stamp));
+	}
+
+	static int stap_tcp_may_undo(struct tcp_sock *tp)
+	{
+		return tp->undo_marker && (!tp->undo_retrans || 
+			stap_tcp_packet_delayed(tp));
+	}
+%}
+
+/** 
+ * Fast recovery event.
+ */
+probe retran.FrEvent =
+	kernel.statement("tcp_fastretrans_alert@net/ipv4/tcp_input.c:3139")
+{
+	if (mem_is_stop()) next
+	if (!$sk->sk_protinfo)
+		next
+	
+	do_FrEvent($sk)	
+}
+
+function do_FrEvent(sk:long)
+%{
+	struct sock *sk = (struct sock *)STAP_ARG_sk;
+	struct stap_info *info = sk->sk_protinfo;
+	struct stap_retrans *retrans = info->retrans;
+	struct sk_buff *skb; 
+	u32 when;	
+
+	if (!retrans)
+		return;
+
+	skb = tcp_write_queue_head(sk);
+	when = ((struct tcp_skb_cb *)&(skb->cb[0]))->when;
+
+	retrans->fr_ev++;
+	retrans->fr_s_t = tcp_time_stamp;
+	retrans->fr_wt += tcp_time_stamp - when;
+%}
+
+/**
+ * Timeout event distribution.
+ */
+probe retran.ToEventDistr = 
+	kernel.statement("tcp_retransmit_timer@net/ipv4/tcp_timer.c:334")
+{
+	if (mem_is_stop()) next
+	if (!$sk->sk_protinfo)
+		next
+
+	do_ToEventDistr($sk)
+}
+
+function do_ToEventDistr(sk:long)
+%{
+	struct sock *sk = (struct sock *)STAP_ARG_sk;
+	struct stap_info *info = sk->sk_protinfo;
+	struct stap_retrans *retrans = info->retrans;
+	struct inet_connection_sock *icsk = inet_csk(sk);
+	struct sk_buff *skb; 
+	u32 when;	
+
+	if (!retrans)
+		return;
+
+	skb = tcp_write_queue_head(sk);
+	when = ((struct tcp_skb_cb *)&(skb->cb[0]))->when;
+
+	retrans->to_ev++;
+	retrans->to_s_t = tcp_time_stamp;
+	retrans->to_wt += tcp_time_stamp - when;
+
+	retrans->ca_bf_to = icsk->icsk_ca_state;
+	retrans->to_ev_distr[icsk->icsk_ca_state]++;
+	retrans->to_wt_distr[icsk->icsk_ca_state] += tcp_time_stamp - when;
+%}
+
+/**
+ * Retrans pkt distribution.
+ */
+probe retran.PktDistr = 
+	kernel.statement("tcp_retransmit_skb@net/ipv4/tcp_output.c:2146")
+{
+	if (mem_is_stop()) next
+	if (!$sk->sk_protinfo)
+		next
+
+	do_PktDistr($sk, $skb)
+}
+
+function do_PktDistr(sk:long, skb:long)
+%{
+	struct sock *sk = (struct sock *)STAP_ARG_sk;
+	struct stap_info *info = sk->sk_protinfo;
+	struct stap_retrans *retrans = info->retrans;
+	struct inet_connection_sock *icsk = inet_csk(sk);
+	int pkts_sent;
+
+	if (!retrans)
+		return;
+
+	pkts_sent = tcp_skb_pcount((struct sk_buff *)STAP_ARG_skb);
+
+	if (icsk->icsk_ca_state == TCP_CA_Recovery) 
+		retrans->fr_rp += pkts_sent;
+	else {
+		retrans->to_rp += pkts_sent;
+		retrans->to_rp_distr[retrans->ca_bf_to] += pkts_sent;
+	} 
+%}
+
+/**
+ * Retrans recover time. 
+ */
+probe retran.RecoverTime = 
+	kernel.statement("tcp_fastretrans_alert@net/ipv4/tcp_input.c:3039")
+{
+	if (mem_is_stop()) next
+	if (!$sk->sk_protinfo)
+		next
+
+	do_RecoverTime($sk)
+	if (%{stap_options.bitmap%} & %{STAPF_HTTP%})
+		do_RespEnd($sk)
+}
+
+function do_RecoverTime(sk:long)
+%{
+	struct sock *sk = (struct sock *)STAP_ARG_sk;
+	struct stap_info *info = sk->sk_protinfo;
+	struct stap_retrans *retrans = info->retrans;
+	struct inet_connection_sock *icsk = inet_csk(sk);
+	u32 now = tcp_time_stamp;
+
+	if (!retrans)
+		return;
+
+	if (icsk->icsk_ca_state == TCP_CA_Recovery)
+		retrans->fr_rt += now - retrans->fr_s_t;
+	else if (icsk->icsk_ca_state == TCP_CA_Loss) {
+		retrans->to_rt += now - retrans->to_s_t;
+		retrans->to_rt_distr[retrans->ca_bf_to] += now - retrans->to_s_t;
+	}
+%}
+
+/** 
+ * Retrans(Fast recovery and Timeout) undo event.
+ */
+probe retran.UndoEvent = 
+	kernel.function("tcp_try_undo_recovery")
+{
+	if (mem_is_stop()) next
+	if (!$sk->sk_protinfo)
+		next
+
+	if (@cast($sk, "inet_connection_sock")->icsk_ca_state 
+		== %{TCP_CA_Recovery%})
+		do_UndoIncr($sk, 1)
+	else
+		do_UndoIncr($sk, 0)
+}
+
+function do_UndoIncr(sk:long, fr:long)
+%{
+	struct sock *sk = (struct sock *)STAP_ARG_sk;
+	struct tcp_sock *tp = tcp_sk(sk);
+	struct stap_info *info = sk->sk_protinfo;
+	struct stap_retrans *retrans = info->retrans;
+
+	if (!retrans)
+		return;
+
+	if (!stap_tcp_may_undo(tp))
+		return;
+
+	if(STAP_ARG_fr)
+		retrans->fr_undo += 1;
+	else
+		retrans->to_undo += 1;
+%}
+
+/**
+ * Timeout undo event.
+ */
+probe retran.ToUndo = 
+	kernel.function("tcp_try_undo_loss")
+{
+	if (mem_is_stop()) next
+	if (!$sk->sk_protinfo)
+		next
+
+	do_UndoIncr($sk, 0)
+}
+
+/** 
+ * Fast recovery undo event. 
+ */
+probe retran.FrUndo = 
+	kernel.function("tcp_try_undo_partial")
+{
+	if (mem_is_stop()) next
+	if (!$sk->sk_protinfo)
+		next
+
+	do_UndoIncr($sk, 1)
+}
+
+/**
+ * FRTO undo event.
+ */
+probe retran.FrtoUndo =
+	kernel.statement("tcp_process_frto@net/ipv4/tcp_input.c:3649")
+{
+	if (mem_is_stop()) next
+	if (!$sk->sk_protinfo)
+		next
+
+	do_UndoIncr($sk, 0)	
+}
+
+/**
+ * Log of loss and retransmission.
+ */
+function log_retrans(sk:long)
+{
+	if (%{stap_options.bitmap%} & %{STAPF_RETRANS%}) {
+		if (!%{stap_options.detail_log%})
+			print(log_default_retrans(sk))
+		else
+			print(log_detail_retrans(sk))
+	}
+}
+
+function log_default_retrans:string (sk:long)
+%{
+	struct sock *sk = (struct sock *)STAP_ARG_sk;
+	struct stap_info *info = sk->sk_protinfo;
+	struct stap_retrans *r = info->retrans;
+	int len = 0, maxlen = MAXSTRINGLEN;
+	char *buf = (char *)STAP_RETVALUE;
+
+	if (r->fr_ev)
+		len = snprintf(buf, maxlen,
+			",fr_ev=%u,fr_repkts=%u,fr_wait=%u,fr_rec=%u,fr_undo=%u", 
+			r->fr_ev, r->fr_rp, r->fr_wt, r->fr_rt, r->fr_undo);
+	else
+		len = snprintf(buf, maxlen,
+			",fr_ev=%d,fr_repkts=%d,fr_wait=%d,fr_rec=%d,fr_undo=%d", 
+			-1, -1, -1, -1, -1);
+
+	if (r->to_ev)
+		len += snprintf(buf + len, maxlen - len,
+			",to_ev=%u,to_repkts=%u,to_wait=%u,to_rec=%u,to_undo=%u", 
+			r->to_ev, r->to_rp, r->to_wt, r->to_rt, r->to_undo);
+	else
+		len += snprintf(buf + len, maxlen - len,
+			",to_ev=%d,to_repkts=%d,to_wait=%d,to_rec=%d,to_undo=%d", 
+			-1, -1, -1, -1, -1);
+%}
+
+function log_detail_retrans:string (sk:long)
+%{
+	struct sock *sk = (struct sock *)STAP_ARG_sk;
+	struct stap_info *info = sk->sk_protinfo;
+	struct stap_retrans *r = info->retrans;
+	int i, len = 0, maxlen = MAXSTRINGLEN;
+	char *buf = (char *)STAP_RETVALUE;
+
+	if (r->fr_ev || r->to_ev) {
+		len = snprintf(buf, maxlen, "%-19s%-11s%-11s%-11s%-11s%-11s\n", 
+			"RETRANS TABLE", "events", "pkts", "wa_time", "rec_time", 
+			"undo");
+
+		if (r->fr_ev)
+			len += snprintf(buf + len, maxlen - len, 
+				"%-19s%-11u%-11u%-11u%-11u%-11u\n", "Fast recovery", 
+				r->fr_ev, r->fr_rp, r->fr_wt, r->fr_rt, r->fr_undo);
+
+		if (r->to_ev) {
+			len += snprintf(buf + len, maxlen - len,
+				"%-19s%-11u%-11u%-11u%-11u%-11u\n", "Timeout", 
+				r->to_ev, r->to_rp, r->to_wt, r->to_rt, r->to_undo);
+		
+			for (i = 0; i < CA_STATE_NUM; i++) {
+				if (!r->to_ev_distr[i])
+					continue;
+
+				len += snprintf(buf + len, maxlen - len,
+					"TO in %-13s%-11u%-11u%-11u%-11u\n",
+					ca_state_name[i], r->to_ev_distr[i], r->to_rp_distr[i], 
+					r->to_wt_distr[i], r->to_rt_distr[i]);
+			}
+		}
+		
+		snprintf(buf + len, maxlen - len, "\n");
+	}
+%}
+
+
