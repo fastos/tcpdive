@@ -55,10 +55,10 @@ How many times when the advertise window of client is zero.
 A packet with RST flag set is sent or received by the connection.
 
 **from_state**    
-The state of a connection before monitor is finishing.
+The state of a connection before monitoring is finishing.
 
 **to_state**    
-The state of a connection after monitor is finished.
+The state of a connection after monitoring is finished.
 
 ## Cwnd / SSthresh ##
 
@@ -72,7 +72,7 @@ Final congestion window size, the unit is MSS.
 Initial slow start threshold, the unit is MSS.
 
 **end_ssthr**    
-Fina slow start threshold, the unit is MSS.
+Final slow start threshold, the unit is MSS.
 
 ## RTT / RTO ##
 
