@@ -1,0 +1,124 @@
+#!/bin/bash
+
+# Version
+TOOL_VER=1.0
+TOOL_RELEASE=stable
+
+KERNEL=2.6.32-431.17.1.el6.x86_64
+KERNEL_NAME=`echo $KERNEL|sed 's/\.x86_64//'`
+
+MODULE="/lib/modules/$KERNEL/kernel/net/ipv4/tcpdive.ko"
+RPM="tcpdive-$KERNEL_NAME-$TOOL_VER-$TOOL_RELEASE.x86_64.rpm"
+
+# Log
+LOG_NAME="tcpdive.log"       # log file name
+LOG_SIZE=500                 # per log file's upper size(MB)
+LOG_NUM=20                   # max number of log files
+
+# Port filter
+PORTS="80"                   # server ports concerned, e.g. 80,8080
+
+start() {
+	staprun -D -S $LOG_SIZE,$LOG_NUM -o $LOG_NAME $MODULE \
+		port_str=$PORTS > /dev/null
+}
+
+stop() {
+	PID=`ps aux|grep stap|grep tcpdive|grep -v grep|awk '{print $2}'`
+	kill -s SIGINT $PID
+}
+
+# 0 - running, 1 - stopped
+status() {
+	local ret=0
+	ps aux|grep stap|grep tcpdive|grep -v grep &> /dev/null || ret=1
+	return $ret
+}
+
+check() {
+	# Check Permission
+	if [ $UID -ne 0 ]; then
+		echo "please run as root."
+		exit 1
+	fi
+
+	# Check installation
+	RPM_NAME=`echo $RPM|sed 's/\.rpm//'` 
+	rpm -qa|grep $RPM_NAME &> /dev/null
+	if [ $? -ne 0 ]; then
+		echo "$RPM is not installed."
+		exit 1
+	fi
+
+	if [ ! -f $MODULE ]; then
+		MODULE="/lib/modules/$KERNEL_NAME/kernel/net/ipv4/tcpdive.ko"
+	fi
+
+	if [ ! -f $MODULE ]; then
+		echo "$MODULE is missing!"
+		echo "please reinstall $RPM."
+		exit 1
+	fi
+
+	# Check kernel version
+	KVER=`uname -r`
+	if [ "$KVER" != "$KERNEL" ]; then
+		echo "Current kernel version: $KVER"
+		echo "Installed tcpdive is for kernel version: $KERNEL"
+		echo "Please install the right version of tcpdive!"
+		exit 1
+	fi
+}
+
+case $1 in
+	start)
+		check
+		status
+		ret=$?
+		if [ $ret -eq 0 ]; then
+			echo "tcpdive is already running..."
+		else
+			# Check corner case
+			lsmod|grep tcpdive|grep -v grep &> /dev/null
+			if [ $? -eq 0 ]; then
+				echo "tcpdive.ko is already insmod."
+				echo "Do some cleaning before reinstall."
+				exit 1
+			fi
+
+			start
+			sleep 1
+			status
+			if [ $? -eq 0 ]; then
+				echo "tcpdive is started."
+			else
+				echo "tcpdive start failed!"
+			fi
+		fi
+		;;
+	stop)
+		status
+		ret=$?
+		if [ $ret -eq 0 ]; then
+			stop
+			sleep 1
+			echo "tcpdive is stopped."
+		else
+			echo "tcpdive is already stopped."
+		fi
+		;;
+	status)
+		status
+		ret=$?
+		if [ $ret -eq 0 ]; then
+			echo "tcpdive is running..."
+		else
+			echo "tcpdive is stopped."
+		fi
+		;;
+	*)
+		echo "Usage: $0 {start|stop|status}"
+		exit 1;;
+esac
+
+
