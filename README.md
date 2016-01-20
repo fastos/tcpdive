@@ -121,7 +121,7 @@ monitor every http request and response. HTTP Keep-Alive is suppported.
 
 For a pair of http request and response, performance indicators listed below are provided.
 
-![HTTP performance indicators](image/http2.jpg "HTTP peformance indicators")
+![HTTP performance indicators](image/http2.jpg "HTTP performance indicators")
 
 Tcpdive can profile HTTP processing in some degree, as illustrated above.    
 Note that all the work is done in TCP Layer, which means it is independent of HTTP applications.
