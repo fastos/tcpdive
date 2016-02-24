@@ -200,7 +200,7 @@ Note that there are two kinds of log formats supported, check [LOG](doc/log.md) 
       -l <msec>     # lifetime of connection should greater than <msec>
       -i <msec>     # trans time of response should greater than <msec>
       -s <num>      # take one sample from <num> connections
-      -p <ports>    # server ports cared, use comma to seperate
+      -p <ports>    # server ports cared, use comma to separate
         
       -f <laddr>:<lport>-<raddr>:<rport> [-f <...>] # should be last
          eg. -f *.*.*.*:80-10.210.136.*:*
