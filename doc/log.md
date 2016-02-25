@@ -7,7 +7,7 @@
 ## DEFAULT FORMAT ##
 
 Each line of log files represents a TCP connection which is profiled by lots of performance indicators. 
-Performance indicators in the same line are recorded in "name=value" way, seperated by commas. 
+Performance indicators in the same line are recorded in "name=value" way, separated by commas. 
 A performance indicator's value can be -1 in case it hasn't been initialized. 
 
 Performance indicators composing a log line are recorded in the following sequence.
